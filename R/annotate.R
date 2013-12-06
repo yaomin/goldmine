@@ -412,25 +412,39 @@ annotateGeneModel <- function(query, genome, cachedir=NULL, flank.bp=1000)
 	# call categories
 	print("Calling categories")
 	ann$itr <- NA
-	ann[ann$intergenic.per>0,]$itr <- "Intergenic"
+	if(any(ann$intergenic.per>0)) {
+	    ann[ann$intergenic.per>0,]$itr <- "Intergenic"
+	}
 
 	ann$utr5 <- NA
-	ann[ann$utr5.per>0,]$utr5 <- "5' UTR"
+	if(any(ann$utr5.per>0)) {
+	    ann[ann$utr5.per>0,]$utr5 <- "5' UTR"
+	}
 
 	ann$utr3 <- NA
-	ann[ann$utr3.per>0,]$utr3 <- "3' UTR"
+        if(any(ann$utr3.per>0)) {
+	    ann[ann$utr3.per>0,]$utr3 <- "3' UTR"
+	}
 
 	ann$exo <- NA
-	ann[ann$exon.per>0,]$exo <- "Exon"
+	if(any(ann$exon.per>0)) {
+	    ann[ann$exon.per>0,]$exo <- "Exon"
+	}
 
 	ann$int <- NA
-	ann[ann$intron.per>0,]$int <- "Intron"
+	if(any(ann$intron.per>0)) {
+	    ann[ann$intron.per>0,]$int <- "Intron"
+	}
 
 	ann$flu <- NA
-	ann[ann$flank.us.per>0,]$flu <- "5' Flank"
+	if(any(ann$flank.us.per>0)) {
+	    ann[ann$flank.us.per>0,]$flu <- "5' Flank"
+	}
 
 	ann$fld <- NA
-	ann[ann$flank.ds.per>0,]$fld <- "3' Flank"
+	if(any(ann$flank.ds.per>0)) {
+	    ann[ann$flank.ds.per>0,]$fld <- "3' Flank"
+	}
 
 	ann$call <- paste(ann$itr, ann$utr5, ann$utr3, ann$exo, ann$int, ann$flu, ann$fld, sep="+")
 	ann$call <- str_replace_all(ann$call,"NA","")
