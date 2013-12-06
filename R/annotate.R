@@ -19,207 +19,215 @@
 #' @export
 annotateSimple <- function(query, genome, cachedir=NULL, flank.bp=1000)
 {
-	# Check that query has the needed columns
-	if(sum(c("chr", "start", "end") %in% colnames(query))!=3)
+    # Check that query has the needed columns
+    if(sum(c("chr", "start", "end") %in% colnames(query))!=3)
+    {
+	stop("Could not find columns named \"chr\", \"start\", and \"end\" in query data.frame")
+    }
+
+    print("Generating annotation regions from UCSC knownGene table")
+
+    # Load the UCSC tables we will need
+    knownGene <- getUCSCTable("knownGene", genome, cachedir)
+    kgXref <- getUCSCTable("kgXref", genome, cachedir)
+    knownCanonical <- getUCSCTable("knownCanonical", genome, cachedir)
+    chromInfo <- getUCSCTable("chromInfo", genome, cachedir)
+
+    # join in gene symbols
+    names(kgXref)[1] <- "name"
+    kg <- join(knownGene, kgXref, by="name", type="left", match="first")
+
+    # join in canonical annotation (largest coding seq from nearest cluster)
+    kgCanon.sub <- data.frame(name=knownCanonical$transcript,canonical="1",stringsAsFactors=FALSE)
+    kg <- join(kg,kgCanon.sub, by="name", type="left", match="first")
+    kg[is.na(kg$canonical),]$canonical <- 0
+
+    # add row number field for future rejoins
+    kg$srow <- 1:nrow(kg)
+
+    # add row number field to input for future rejoins
+    query$qrow <- 1:nrow(query)
+
+    # Turn input data into GRanges
+    input.gr <- GRanges(seqnames=query$chr, ranges=IRanges(start=query$start, end=query$end), qrow=query$qrow)
+    seqlengths(input.gr) <- chromInfo[match(names(seqlengths(input.gr)), chromInfo$chr),]$size
+
+    # Make genic GRanges
+    genic.gr <- with(kg, GRanges(seqnames=chrom, ranges=IRanges(start=txStart+1,end=txEnd), srow=srow))
+    genic.full.gr <- genic.gr
+    genic.gr <- reduce(genic.gr)
+    seqlengths(genic.gr) <- chromInfo[match(names(seqlengths(genic.gr)), chromInfo$chr),]$size
+
+    # Make flank GRanges
+    flank.gr <- suppressWarnings(c(flank(genic.gr, flank.bp, start=T), flank(genic.gr, flank.bp, start=F)))
+    flank.full.gr <- suppressWarnings(c(flank(genic.full.gr, flank.bp, start=T), flank(genic.full.gr, flank.bp, start=F)))
+    flank.gr <- reduce(flank.gr)
+    flank.gr <- setdiff(flank.gr, genic.gr)
+
+    # Make intergenic GRanges
+    intergenic.gr <- GRanges(seqnames=chromInfo$chrom, ranges=IRanges(start=1, end=chromInfo$size))
+    seqlengths(intergenic.gr) <- chromInfo[match(names(seqlengths(intergenic.gr)), chromInfo$chr),]$size
+    intergenic.gr <- setdiff(intergenic.gr, genic.gr)
+    intergenic.gr <- setdiff(intergenic.gr, flank.gr)
+
+    # Debug: write BED files to make sure we have the sets correct
+    #writeBEDFromGRanges(flank.gr, file="flank.bed")
+    #writeBEDFromGRanges(genic.gr, file="genic.bed")
+    #writeBEDFromGRanges(intergenic.gr, file="intergenic.bed")
+
+    # Debug: Check our set math, should all return empty sets (mutually exclusive ranges)
+    #intersect(genic.gr, intergenic.gr)
+    #intersect(genic.gr, flank.gr)
+    #intersect(flank.gr, intergenic.gr)
+
+    # Annotate with % overlaps and gene names
+    print("Computing % Overlaps")
+    ann <- data.frame(genic.per=calcPercentOverlap(input.gr, genic.gr), flank.per=calcPercentOverlap(input.gr, flank.gr), intergenic.per=calcPercentOverlap(input.gr, intergenic.gr))
+
+    # Internal function to return list of gene names (no duplicates that are in the reported genic overlap or belong to all or part of the reported flanking overlap)
+    # Will return name number of rows as subject.gr, with blanks reported if no genes overlapped
+    # Needs a kg knownGene table so we can pull the names
+    getGeneList <- function(query.gr, subject.gr, kg)
+    {
+	# Perform overlaps
+	overlaps.fo <- findOverlaps(query.gr, subject.gr)
+
+	# Make DF with gene symbol for each overlap
+	genes.df <- data.frame(qrow=queryHits(overlaps.fo), srow=subjectHits(overlaps.fo))
+	genes.df$gene <- kg[genes.df$srow,]$geneSymbol
+
+	# Condense into comma-separated lists, removing duplicate symbols
+	commaGenes <- function(x)
 	{
-		stop("Could not find columns named \"chr\", \"start\", and \"end\" in query data.frame")
+	    genes <- unique(kg[x$srow,]$geneSymbol)
+	    genes <- paste(genes, collapse=", ")
+	}
+	g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
+
+	# Join back to original rowids
+	g <- data.frame(qrow=as.numeric(names(g)), genes=as.vector(g))
+
+	# Add blanks for intergenics
+	out <- data.frame(qrow=query.gr$qrow)
+	out <- join(out, g , by="qrow", type="left", match="first")
+	out$genes <- as.character(out$genes)
+	if(any(is.na(out$genes))) {
+	    out[is.na(out$genes),]$genes <- ""
 	}
 
-	print("Generating annotation regions from UCSC knownGene table")
+	# Return vector of strings, rows matching input.gr
+	out$genes
+    }
+    # maps IDs to use the flank list
+    # to get these, we need both the set reduced/diffed version and the non. We'll intersect with the reduced version then intersect back to the non-reduced version to pull out what genes were involved in that flank.
+    getGeneListForFlanks <- function(query.gr, flank.gr, flank.full.gr, kg)
+    {
+	# Perform overlaps against reduced list
+	overlaps.fo <- findOverlaps(query.gr, flank.gr)
+	o.f.gr <- flank.gr[subjectHits(overlaps.fo)]
+	o.f.gr$qrow <- queryHits(overlaps.fo)
 
-	# Load the UCSC tables we will need
-	knownGene <- getUCSCTable("knownGene", genome, cachedir)
-	kgXref <- getUCSCTable("kgXref", genome, cachedir)
-	knownCanonical <- getUCSCTable("knownCanonical", genome, cachedir)
-	chromInfo <- getUCSCTable("chromInfo", genome, cachedir)
+	# Now we have pairs of reduced regions and query regions
+	# Want to know which unreduced srow contributed to the reduced version
+	# Intersect these regions back to the original to find out!
+	o2.fo <- findOverlaps(o.f.gr, flank.full.gr)
 
-	# join in gene symbols
-	names(kgXref)[1] <- "name"
-	kg <- join(knownGene, kgXref, by="name", type="left", match="first")
+	# Make DF with gene symbol for each overlap
+	genes.df <- data.frame(qrow=o.f.gr[queryHits(o2.fo)]$qrow, srow=subjectHits(o2.fo))
+	genes.df$gene <- kg[flank.full.gr[genes.df$srow]$srow,]$geneSymbol
 
-	# join in canonical annotation (largest coding seq from nearest cluster)
-	kgCanon.sub <- data.frame(name=knownCanonical$transcript,canonical="1",stringsAsFactors=FALSE)
-	kg <- join(kg,kgCanon.sub, by="name", type="left", match="first")
-	kg[is.na(kg$canonical),]$canonical <- 0
-
-	# add row number field for future rejoins
-	kg$srow <- 1:nrow(kg)
-
-	# add row number field to input for future rejoins
-	query$qrow <- 1:nrow(query)
-
-	# Turn input data into GRanges
-	input.gr <- GRanges(seqnames=query$chr, ranges=IRanges(start=query$start, end=query$end), qrow=query$qrow)
-	seqlengths(input.gr) <- chromInfo[match(names(seqlengths(input.gr)), chromInfo$chr),]$size
-
-	# Make genic GRanges
-	genic.gr <- with(kg, GRanges(seqnames=chrom, ranges=IRanges(start=txStart+1,end=txEnd), srow=srow))
-	genic.full.gr <- genic.gr
-	genic.gr <- reduce(genic.gr)
-	seqlengths(genic.gr) <- chromInfo[match(names(seqlengths(genic.gr)), chromInfo$chr),]$size
-
-	# Make flank GRanges
-	flank.gr <- suppressWarnings(c(flank(genic.gr, flank.bp, start=T), flank(genic.gr, flank.bp, start=F)))
-	flank.full.gr <- suppressWarnings(c(flank(genic.full.gr, flank.bp, start=T), flank(genic.full.gr, flank.bp, start=F)))
-	flank.gr <- reduce(flank.gr)
-	flank.gr <- setdiff(flank.gr, genic.gr)
-
-	# Make intergenic GRanges
-	intergenic.gr <- GRanges(seqnames=chromInfo$chrom, ranges=IRanges(start=1, end=chromInfo$size))
-	seqlengths(intergenic.gr) <- chromInfo[match(names(seqlengths(intergenic.gr)), chromInfo$chr),]$size
-	intergenic.gr <- setdiff(intergenic.gr, genic.gr)
-	intergenic.gr <- setdiff(intergenic.gr, flank.gr)
-
-	# Debug: write BED files to make sure we have the sets correct
-	#writeBEDFromGRanges(flank.gr, file="flank.bed")
-	#writeBEDFromGRanges(genic.gr, file="genic.bed")
-	#writeBEDFromGRanges(intergenic.gr, file="intergenic.bed")
-
-	# Debug: Check our set math, should all return empty sets (mutually exclusive ranges)
-	#intersect(genic.gr, intergenic.gr)
-	#intersect(genic.gr, flank.gr)
-	#intersect(flank.gr, intergenic.gr)
-
-	# Annotate with % overlaps and gene names
-	print("Computing % Overlaps")
-	ann <- data.frame(genic.per=calcPercentOverlap(input.gr, genic.gr), flank.per=calcPercentOverlap(input.gr, flank.gr), intergenic.per=calcPercentOverlap(input.gr, intergenic.gr))
-
-	# Internal function to return list of gene names (no duplicates that are in the reported genic overlap or belong to all or part of the reported flanking overlap)
-	# Will return name number of rows as subject.gr, with blanks reported if no genes overlapped
-	# Needs a kg knownGene table so we can pull the names
-	getGeneList <- function(query.gr, subject.gr, kg)
+	# Condense into comma-separated lists, removing duplicate symbols
+	commaGenes <- function(x)
 	{
-		# Perform overlaps
-		overlaps.fo <- findOverlaps(query.gr, subject.gr)
-
-		# Make DF with gene symbol for each overlap
-		genes.df <- data.frame(qrow=queryHits(overlaps.fo), srow=subjectHits(overlaps.fo))
-		genes.df$gene <- kg[genes.df$srow,]$geneSymbol
-
-		# Condense into comma-separated lists, removing duplicate symbols
-		commaGenes <- function(x)
-		{
-			genes <- unique(kg[x$srow,]$geneSymbol)
-			genes <- paste(genes, collapse=", ")
-		}
-		g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
-
-		# Join back to original rowids
-		g <- data.frame(qrow=as.numeric(names(g)), genes=as.vector(g))
-
-		# Add blanks for intergenics
-		out <- data.frame(qrow=query.gr$qrow)
-		out <- join(out, g , by="qrow", type="left", match="first")
-		out$genes <- as.character(out$genes)
-		out[is.na(out$genes),]$genes <- ""
-
-		# Return vector of strings, rows matching input.gr
-		out$genes
+	    genes <- unique(kg[flank.full.gr[x$srow,]$srow,]$geneSymbol)
+	    genes <- paste(genes, collapse=", ")
 	}
-	# maps IDs to use the flank list
-	# to get these, we need both the set reduced/diffed version and the non. We'll intersect with the reduced version then intersect back to the non-reduced version to pull out what genes were involved in that flank.
-	getGeneListForFlanks <- function(query.gr, flank.gr, flank.full.gr, kg)
+	g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
+
+	# Join back to original rowids
+	g <- data.frame(qrow=as.numeric(names(g)), genes=as.vector(g))
+
+	# Add blanks for intergenics
+	out <- data.frame(qrow=query.gr$qrow)
+	out <- join(out, g , by="qrow", type="left", match="first")
+	out$genes <- as.character(out$genes)
+	out[is.na(out$genes),]$genes <- ""
+
+	# Return vector of strings, rows matching input.gr
+	out$genes
+    }
+    # find nearest gene, return DF of nearest and distance to
+    getNearestGene <- function(query.gr, subject.gr, kg)
+    {
+	near.fo <- as.data.frame(suppressWarnings(nearest(query.gr, subject.gr, select="all")))
+	near.fo$dist <- suppressWarnings(distance(query.gr[near.fo$queryHits], subject.gr[near.fo$subjectHits]))
+
+	# Make DF with gene symbol for each overlap
+	genes.df <- data.frame(qrow=near.fo$queryHits, srow=near.fo$subjectHits, dist=near.fo$dist)
+	genes.df$gene <- kg[subject.gr[genes.df$srow]$srow,]$geneSymbol
+
+	# Condense into comma-separated lists, removing duplicate symbols
+	out <- vector("character",length=length(unique(genes.df$qrow)))
+
+	commaGenes <- function(x)
 	{
-		# Perform overlaps against reduced list
-		overlaps.fo <- findOverlaps(query.gr, flank.gr)
-		o.f.gr <- flank.gr[subjectHits(overlaps.fo)]
-		o.f.gr$qrow <- queryHits(overlaps.fo)
-
-		# Now we have pairs of reduced regions and query regions
-		# Want to know which unreduced srow contributed to the reduced version
-		# Intersect these regions back to the original to find out!
-		o2.fo <- findOverlaps(o.f.gr, flank.full.gr)
-
-		# Make DF with gene symbol for each overlap
-		genes.df <- data.frame(qrow=o.f.gr[queryHits(o2.fo)]$qrow, srow=subjectHits(o2.fo))
-		genes.df$gene <- kg[flank.full.gr[genes.df$srow]$srow,]$geneSymbol
-
-		# Condense into comma-separated lists, removing duplicate symbols
-		commaGenes <- function(x)
-		{
-			genes <- unique(kg[flank.full.gr[x$srow,]$srow,]$geneSymbol)
-			genes <- paste(genes, collapse=", ")
-		}
-		g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
-
-		# Join back to original rowids
-		g <- data.frame(qrow=as.numeric(names(g)), genes=as.vector(g))
-
-		# Add blanks for intergenics
-		out <- data.frame(qrow=query.gr$qrow)
-		out <- join(out, g , by="qrow", type="left", match="first")
-		out$genes <- as.character(out$genes)
-		out[is.na(out$genes),]$genes <- ""
-
-		# Return vector of strings, rows matching input.gr
-		out$genes
+	    genes <- unique(kg[subject.gr[x$srow,]$srow,]$geneSymbol)
+	    genes <- paste(genes, collapse=", ")
 	}
-	# find nearest gene, return DF of nearest and distance to
-	getNearestGene <- function(query.gr, subject.gr, kg)
-	{
-		near.fo <- as.data.frame(suppressWarnings(nearest(query.gr, subject.gr, select="all")))
-		near.fo$dist <- suppressWarnings(distance(query.gr[near.fo$queryHits], subject.gr[near.fo$subjectHits]))
+	g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
 
-		# Make DF with gene symbol for each overlap
-		genes.df <- data.frame(qrow=near.fo$queryHits, srow=near.fo$subjectHits, dist=near.fo$dist)
-		genes.df$gene <- kg[subject.gr[genes.df$srow]$srow,]$geneSymbol
+	# Join back to original rowids
+	g <- data.frame(qrow=as.numeric(names(g)), nearest.gene=as.vector(g))
 
-		# Condense into comma-separated lists, removing duplicate symbols
-		out <- vector("character",length=length(unique(genes.df$qrow)))
+	# Add blanks for intergenics
+	out <- data.frame(qrow=query.gr$qrow)
+	out <- join(out, g , by="qrow", type="left", match="first")
+	out$nearest.gene <- as.character(out$nearest.gene)
 
-		commaGenes <- function(x)
-		{
-			genes <- unique(kg[subject.gr[x$srow,]$srow,]$geneSymbol)
-			genes <- paste(genes, collapse=", ")
-		}
-		g <- by(genes.df, INDICES=genes.df$qrow, FUN=commaGenes)
+	# Add distance in bp
+	ddf <- data.frame(qrow=near.fo$queryHits, nearest.bp=near.fo$dist)
+	out <- join(out, ddf, by="qrow", type="left", match="first")
 
-		# Join back to original rowids
-		g <- data.frame(qrow=as.numeric(names(g)), nearest.gene=as.vector(g))
+	# Return df
+	out
 
-		# Add blanks for intergenics
-		out <- data.frame(qrow=query.gr$qrow)
-		out <- join(out, g , by="qrow", type="left", match="first")
-		out$nearest.gene <- as.character(out$nearest.gene)
+    }
 
-		# Add distance in bp
-		ddf <- data.frame(qrow=near.fo$queryHits, nearest.bp=near.fo$dist)
-		out <- join(out, ddf, by="qrow", type="left", match="first")
-
-		# Return df
-		out
-
-	}
-
-	# call categories
-	print("Calling categories")
-	ann$gen <- NA
+    # call categories
+    print("Calling categories")
+    ann$gen <- NA
+    if(any(ann$genic.per>0)) {
 	ann[ann$genic.per>0,]$gen <- "genic"
-	ann$cis <- NA
+    }
+    ann$cis <- NA
+    if(any(ann$flank.per>0)) {
 	ann[ann$flank.per>0,]$cis <- "flank"
-	ann$int <- NA
+    }
+    ann$int <- NA
+    if(any(ann$intergenic.per>0)) {
 	ann[ann$intergenic.per>0,]$int <- "intergenic"
+    }
 
-	ann$call <- paste(ann$gen, ann$cis, ann$int, sep="+")
-	ann$call <- str_replace_all(ann$call,"NA","")
-	ann$call <- str_replace_all(ann$call,"\\+\\+","\\+")
-	ann$call <- str_replace_all(ann$call,"^\\+","")
-	ann$call <- str_replace_all(ann$call,"\\+$","")
+    ann$call <- paste(ann$gen, ann$cis, ann$int, sep="+")
+    ann$call <- str_replace_all(ann$call,"NA","")
+    ann$call <- str_replace_all(ann$call,"\\+\\+","\\+")
+    ann$call <- str_replace_all(ann$call,"^\\+","")
+    ann$call <- str_replace_all(ann$call,"\\+$","")
 
-	ann$gen <- NULL
-	ann$int <- NULL
-	ann$cis <- NULL
+    ann$gen <- NULL
+    ann$int <- NULL
+    ann$cis <- NULL
 
-	print("Pulling gene symbols for overlaps")
-	ann$genic.genes <- getGeneList(input.gr, genic.full.gr, kg)
-	ann$flank.genes <- getGeneListForFlanks(input.gr, flank.gr, flank.full.gr, kg)
+    print("Pulling gene symbols for overlaps")
+    ann$genic.genes <- getGeneList(input.gr, genic.full.gr, kg)
+    ann$flank.genes <- getGeneListForFlanks(input.gr, flank.gr, flank.full.gr, kg)
 
-	ann <- cbind(ann, getNearestGene(input.gr, genic.full.gr, kg))
+    ann <- cbind(ann, getNearestGene(input.gr, genic.full.gr, kg))
 
-	ann$url <- getBrowserURLs(input.gr, genome)
+    ann$url <- getBrowserURLs(input.gr, genome)
 
-	# return the annotated columns
-	cbind(query, ann)
+    # return the annotated columns
+    cbind(query, ann)
 }
 # -----------------------------------------------------------------------------
 
